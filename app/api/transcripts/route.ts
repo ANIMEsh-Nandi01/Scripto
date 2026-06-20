@@ -10,9 +10,9 @@ import {
 import { getSubtitles } from "youtube-caption-extractor";
 import { formatTime, type TranscriptApiError, type TranscriptData, type TranscriptSegment } from "@/lib/transcript";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 export const dynamic = "force-dynamic";
-export const preferredRegion = "bom1";
+export const preferredRegion = "global";
 
 const ALLOWED_HOSTS = new Set([
   "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
@@ -90,9 +90,12 @@ async function extractTranscript(
         start: Number.parseFloat(segment.start),
         duration: Number.parseFloat(segment.dur),
       })).filter((segment) => segment.text.length > 0 && Number.isFinite(segment.start));
-      // An empty response is authoritative: the video plays but YouTube has no
-      // caption track, so avoid extra requests that only increase throttling.
-      return { segments, language: language ?? "en" };
+      // A playable response can still omit captions when a particular YouTube
+      // client is restricted. Only accept a non-empty result here; verify an
+      // empty response with the independent extractor below before reporting
+      // that the video genuinely has no captions.
+      if (segments.length) return { segments, language: language ?? "en" };
+      break;
     } catch (error) {
       multiClientError = error;
       const message = error instanceof Error ? error.message : "";
