@@ -55,6 +55,20 @@ function apiError(code: string, message: string, status: number, video?: Transcr
   return NextResponse.json({ code, message, ...(video ? { video } : {}) }, { status });
 }
 
+async function hasIndependentCaptionTrack(videoId: string, controlledFetch: typeof fetch) {
+  try {
+    const response = await controlledFetch(`https://inv.nadeko.net/api/v1/captions/${videoId}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!response.ok) return false;
+    const data = await response.json() as { captions?: unknown[] };
+    return Array.isArray(data.captions) && data.captions.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 class CaptionDeliveryBlockedError extends Error {
   constructor() {
     super("YouTube exposed a caption track but returned an empty caption document.");
@@ -151,6 +165,17 @@ export async function handleTranscriptRequest(request: Request) {
     ]);
     const { segments } = extraction;
     if (!segments.length) {
+      // A shared YouTube egress IP can receive a player response with captions
+      // removed. Cross-check a separate privacy frontend before claiming that
+      // the creator supplied no captions at all.
+      if (await hasIndependentCaptionTrack(videoId, controlledFetch)) {
+        return apiError(
+          "CAPTION_FETCH_BLOCKED",
+          "This video has captions, but YouTube is currently blocking their delivery from the available server networks. Please try again shortly.",
+          502,
+          errorVideo(videoId, metadata),
+        );
+      }
       return apiError(
         "NO_CAPTIONS",
         "YouTube does not provide a caption track for this video.",
