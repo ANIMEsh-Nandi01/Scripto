@@ -12,6 +12,7 @@ import { formatTime, type TranscriptApiError, type TranscriptData, type Transcri
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const preferredRegion = "bom1";
 
 const ALLOWED_HOSTS = new Set([
   "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
@@ -76,28 +77,50 @@ async function extractTranscript(
   language: string | undefined,
   controlledFetch: typeof fetch,
 ): Promise<{ segments: TranscriptSegment[]; language: string }> {
+  let multiClientError: unknown;
+
+  // Start with the maintained multi-client extractor. It rotates through
+  // several YouTube clients, which is substantially more resilient on shared
+  // serverless egress than the legacy single-client path.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fallback = await getSubtitles({ videoID: videoId, lang: language ?? "en", fetch: controlledFetch });
+      const segments = fallback.map((segment) => ({
+        text: segment.text.trim(),
+        start: Number.parseFloat(segment.start),
+        duration: Number.parseFloat(segment.dur),
+      })).filter((segment) => segment.text.length > 0 && Number.isFinite(segment.start));
+      // An empty response is authoritative: the video plays but YouTube has no
+      // caption track, so avoid extra requests that only increase throttling.
+      return { segments, language: language ?? "en" };
+    } catch (error) {
+      multiClientError = error;
+      const message = error instanceof Error ? error.message : "";
+      const permanent = message.includes("Video unavailable") || message.includes("private");
+      if (permanent || attempt === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+  }
+
+  // Fall back to the older extractor only when every multi-client route failed.
   try {
     const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang: language, fetch: controlledFetch });
     const segments = normalizePrimary(raw);
     if (segments.length) {
       return { segments, language: raw.find((segment) => segment.lang)?.lang ?? language ?? "en" };
     }
+    return { segments: [], language: language ?? "en" };
   } catch (error) {
     const missing = error instanceof YoutubeTranscriptNotAvailableError
       || error instanceof YoutubeTranscriptDisabledError
       || error instanceof YoutubeTranscriptNotAvailableLanguageError;
-    if (!missing) throw error;
+    if (missing) return { segments: [], language: language ?? "en" };
+    // Prefer the typed legacy error when available, while retaining the
+    // multi-client failure text for classification if the legacy error is vague.
+    if (error instanceof YoutubeTranscriptTooManyRequestError
+      || error instanceof YoutubeTranscriptVideoUnavailableError) throw error;
+    throw multiClientError ?? error;
   }
-
-  // A maintained multi-client extractor catches caption tracks that YouTube's
-  // older web/Android responses occasionally omit on serverless deployments.
-  const fallback = await getSubtitles({ videoID: videoId, lang: language ?? "en", fetch: controlledFetch });
-  const segments = fallback.map((segment) => ({
-    text: segment.text.trim(),
-    start: Number.parseFloat(segment.start),
-    duration: Number.parseFloat(segment.dur),
-  })).filter((segment) => segment.text.length > 0 && Number.isFinite(segment.start));
-  return { segments, language: language ?? "en" };
 }
 
 export async function POST(request: Request) {
