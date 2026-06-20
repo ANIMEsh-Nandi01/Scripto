@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`, paste a public YouTube URL, and select **Get transcript**.
+Open `http://localhost:3000`, paste a public YouTube URL, and select **Get transcript**. Scripto accepts public YouTube URLs and produces text whenever YouTube exposes a manual or automatically generated caption track.
 
 ## API
 
@@ -28,4 +28,4 @@ The response contains video metadata, the selected language, and normalized tran
 
 ## Limitations
 
-Transcript extraction uses YouTube's unofficial caption endpoints. Videos without captions, private or age-restricted videos, and temporary YouTube rate limits can prevent extraction. Hosting providers with shared datacenter IPs may encounter rate limits more often than a local connection.
+Transcript extraction uses YouTube's unofficial caption endpoints. When a public video has no caption track, Scripto shows the video details and explains that no transcript is available; it does not download or transcribe the audio. Private or age-restricted videos and temporary YouTube rate limits can also prevent extraction. Hosting providers with shared datacenter IPs may encounter rate limits more often than a local connection.

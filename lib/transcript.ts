@@ -23,6 +23,7 @@ export type TranscriptData = {
 export type TranscriptApiError = {
   code: string;
   message: string;
+  video?: Omit<TranscriptVideo, "duration">;
 };
 
 export function formatTime(seconds: number) {

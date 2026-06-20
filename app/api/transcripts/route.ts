@@ -7,7 +7,8 @@ import {
   YoutubeTranscriptTooManyRequestError,
   YoutubeTranscriptVideoUnavailableError,
 } from "youtube-transcript";
-import { formatTime, type TranscriptData } from "@/lib/transcript";
+import { getSubtitles } from "youtube-caption-extractor";
+import { formatTime, type TranscriptApiError, type TranscriptData, type TranscriptSegment } from "@/lib/transcript";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,8 +44,60 @@ async function getMetadata(videoId: string) {
   } catch { return fallback; }
 }
 
-function apiError(code: string, message: string, status: number) {
-  return NextResponse.json({ code, message }, { status });
+function errorVideo(videoId: string, metadata: { title: string; channel: string }) {
+  return {
+    id: videoId,
+    url: `https://www.youtube.com/watch?v=${videoId}`,
+    title: metadata.title,
+    channel: metadata.channel,
+    thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+  };
+}
+
+function apiError(code: string, message: string, status: number, video?: TranscriptApiError["video"]) {
+  return NextResponse.json({ code, message, ...(video ? { video } : {}) }, { status });
+}
+
+function normalizePrimary(raw: Awaited<ReturnType<typeof YoutubeTranscript.fetchTranscript>>) {
+  // The upstream package returns milliseconds from InnerTube and seconds from
+  // its legacy XML fallback, so infer and normalize the unit from cue duration.
+  const sortedDurations = raw.map((segment) => segment.duration).sort((a, b) => a - b);
+  const medianDuration = sortedDurations[Math.floor(sortedDurations.length / 2)] ?? 0;
+  const unitDivisor = medianDuration > 100 ? 1000 : 1;
+  return raw.map((segment) => ({
+    text: segment.text.trim(),
+    start: segment.offset / unitDivisor,
+    duration: segment.duration / unitDivisor,
+  })).filter((segment) => segment.text.length > 0);
+}
+
+async function extractTranscript(
+  videoId: string,
+  language: string | undefined,
+  controlledFetch: typeof fetch,
+): Promise<{ segments: TranscriptSegment[]; language: string }> {
+  try {
+    const raw = await YoutubeTranscript.fetchTranscript(videoId, { lang: language, fetch: controlledFetch });
+    const segments = normalizePrimary(raw);
+    if (segments.length) {
+      return { segments, language: raw.find((segment) => segment.lang)?.lang ?? language ?? "en" };
+    }
+  } catch (error) {
+    const missing = error instanceof YoutubeTranscriptNotAvailableError
+      || error instanceof YoutubeTranscriptDisabledError
+      || error instanceof YoutubeTranscriptNotAvailableLanguageError;
+    if (!missing) throw error;
+  }
+
+  // A maintained multi-client extractor catches caption tracks that YouTube's
+  // older web/Android responses occasionally omit on serverless deployments.
+  const fallback = await getSubtitles({ videoID: videoId, lang: language ?? "en", fetch: controlledFetch });
+  const segments = fallback.map((segment) => ({
+    text: segment.text.trim(),
+    start: Number.parseFloat(segment.start),
+    duration: Number.parseFloat(segment.dur),
+  })).filter((segment) => segment.text.length > 0 && Number.isFinite(segment.start));
+  return { segments, language: language ?? "en" };
 }
 
 export async function POST(request: Request) {
@@ -60,24 +113,25 @@ export async function POST(request: Request) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 20_000);
   const controlledFetch: typeof fetch = (input, init) => fetch(input, { ...init, signal: controller.signal });
+  const metadataPromise = getMetadata(videoId);
 
   try {
-    const [rawSegments, metadata] = await Promise.all([
-      YoutubeTranscript.fetchTranscript(videoId, { lang: language, fetch: controlledFetch }),
-      getMetadata(videoId),
+    const [extraction, metadata] = await Promise.all([
+      extractTranscript(videoId, language, controlledFetch),
+      metadataPromise,
     ]);
-    if (!rawSegments.length) return apiError("NO_CAPTIONS", "No transcript was found for this video.", 404);
+    const { segments } = extraction;
+    if (!segments.length) {
+      return apiError(
+        "NO_CAPTIONS",
+        "YouTube does not provide a caption track for this video.",
+        404,
+        errorVideo(videoId, metadata),
+      );
+    }
 
-    // The upstream package currently returns milliseconds from its InnerTube path
-    // and seconds from its legacy XML fallback, so normalize both formats here.
-    const sortedDurations = rawSegments.map((segment) => segment.duration).sort((a, b) => a - b);
-    const medianDuration = sortedDurations[Math.floor(sortedDurations.length / 2)] ?? 0;
-    const unitDivisor = medianDuration > 100 ? 1000 : 1;
-    const segments = rawSegments.map((segment) => ({
-      text: segment.text.trim(), start: segment.offset / unitDivisor, duration: segment.duration / unitDivisor,
-    })).filter((segment) => segment.text.length > 0);
     const totalSeconds = Math.max(...segments.map((segment) => segment.start + segment.duration));
-    const selectedLanguage = rawSegments.find((segment) => segment.lang)?.lang ?? language ?? "en";
+    const selectedLanguage = extraction.language;
     const data: TranscriptData = {
       video: {
         id: videoId, url: `https://www.youtube.com/watch?v=${videoId}`,
@@ -90,12 +144,21 @@ export async function POST(request: Request) {
     };
     return NextResponse.json(data, { headers: { "Cache-Control": "private, max-age=300" } });
   } catch (error) {
+    const metadata = await metadataPromise;
+    const video = errorVideo(videoId, metadata);
     if (error instanceof YoutubeTranscriptTooManyRequestError) return apiError("RATE_LIMITED", "YouTube is temporarily limiting transcript requests. Try again shortly.", 429);
-    if (error instanceof YoutubeTranscriptVideoUnavailableError) return apiError("VIDEO_UNAVAILABLE", "This video is private, removed, or unavailable.", 404);
-    if (error instanceof YoutubeTranscriptDisabledError) return apiError("CAPTIONS_DISABLED", "The creator has disabled captions for this video.", 404);
-    if (error instanceof YoutubeTranscriptNotAvailableLanguageError) return apiError("LANGUAGE_UNAVAILABLE", error.message, 422);
-    if (error instanceof YoutubeTranscriptNotAvailableError) return apiError("NO_CAPTIONS", "No transcript is available for this video.", 404);
+    if (error instanceof YoutubeTranscriptVideoUnavailableError) return apiError("VIDEO_UNAVAILABLE", "This video is private, removed, or unavailable.", 404, video);
+    if (error instanceof YoutubeTranscriptDisabledError) return apiError("CAPTIONS_DISABLED", "The creator has turned off captions for this video.", 404, video);
+    if (error instanceof YoutubeTranscriptNotAvailableLanguageError) return apiError("LANGUAGE_UNAVAILABLE", error.message, 422, video);
+    if (error instanceof YoutubeTranscriptNotAvailableError) return apiError("NO_CAPTIONS", "YouTube does not provide a caption track for this video.", 404, video);
     if (controller.signal.aborted) return apiError("TIMEOUT", "YouTube took too long to respond. Please try again.", 504);
+    const fallbackMessage = error instanceof Error ? error.message : "";
+    if (fallbackMessage.includes("Video unavailable") || fallbackMessage.includes("private")) {
+      return apiError("VIDEO_UNAVAILABLE", "This video is private, removed, or unavailable.", 404, video);
+    }
+    if (fallbackMessage.includes("LOGIN_REQUIRED") || fallbackMessage.includes("not a bot") || fallbackMessage.includes("429")) {
+      return apiError("RATE_LIMITED", "YouTube is temporarily limiting transcript requests. Try again shortly.", 429);
+    }
     console.error("Transcript fetch failed", error);
     return apiError("FETCH_FAILED", "We could not fetch this transcript. The video may be restricted or YouTube may be blocking requests.", 502);
   } finally {
