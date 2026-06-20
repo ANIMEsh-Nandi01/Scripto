@@ -23,7 +23,10 @@ export default function Home() {
     setError(""); setApiError(null); setStatus("loading"); setLastUrl(url); localStorage.setItem("scripto-recent", url);
     try {
       const endpoints = ["/api/transcripts", "/api/transcripts-eu", "/api/transcripts-us"];
-      const retryableCodes = ["CAPTION_FETCH_BLOCKED", "RATE_LIMITED", "TIMEOUT", "FETCH_FAILED", "NETWORK_ERROR"];
+      // YouTube can hide an existing caption track from one datacenter while
+      // exposing it in another, so even a regional NO_CAPTIONS result must be
+      // checked against the remaining Edge locations before it is final.
+      const retryableCodes = ["NO_CAPTIONS", "CAPTIONS_DISABLED", "CAPTION_FETCH_BLOCKED", "RATE_LIMITED", "TIMEOUT", "FETCH_FAILED", "NETWORK_ERROR"];
       let finalFailure: TranscriptApiError = { code: "NETWORK_ERROR", message: "Could not reach the transcript service." };
 
       for (const endpoint of endpoints) {
