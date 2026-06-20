@@ -22,13 +22,27 @@ export default function Home() {
     if (!valid) { setError("Enter a valid YouTube, Shorts, or youtu.be link."); return; }
     setError(""); setApiError(null); setStatus("loading"); setLastUrl(url); localStorage.setItem("scripto-recent", url);
     try {
-      const response = await fetch("/api/transcripts", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, language: language ?? null }),
-      });
-      const payload = await response.json() as TranscriptData | TranscriptApiError;
-      if (!response.ok) throw payload;
-      setData(payload as TranscriptData); setStatus("ready");
+      const endpoints = ["/api/transcripts", "/api/transcripts-eu", "/api/transcripts-us"];
+      const retryableCodes = ["CAPTION_FETCH_BLOCKED", "RATE_LIMITED", "TIMEOUT", "FETCH_FAILED", "NETWORK_ERROR"];
+      let finalFailure: TranscriptApiError = { code: "NETWORK_ERROR", message: "Could not reach the transcript service." };
+
+      for (const endpoint of endpoints) {
+        try {
+          const response = await fetch(endpoint, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, language: language ?? null }),
+          });
+          const payload = await response.json() as TranscriptData | TranscriptApiError;
+          if (response.ok) { setData(payload as TranscriptData); setStatus("ready"); return; }
+          finalFailure = payload as TranscriptApiError;
+          if (!retryableCodes.includes(finalFailure.code)) throw finalFailure;
+        } catch (cause) {
+          const failure = cause as Partial<TranscriptApiError>;
+          finalFailure = { code: failure.code ?? "NETWORK_ERROR", message: failure.message ?? "Could not reach this transcript route.", video: failure.video };
+          if (!retryableCodes.includes(finalFailure.code)) throw finalFailure;
+        }
+      }
+      throw finalFailure;
     } catch (cause) {
       const failure = cause as Partial<TranscriptApiError>;
       setApiError({ code: failure.code ?? "NETWORK_ERROR", message: failure.message ?? "Could not reach the transcript service. Check your connection and try again.", video: failure.video });
@@ -37,7 +51,7 @@ export default function Home() {
   };
 
   const reset = () => { setStatus("idle"); setData(null); setApiError(null); setError(""); };
-  const transientError = apiError && ["RATE_LIMITED", "TIMEOUT", "FETCH_FAILED", "NETWORK_ERROR"].includes(apiError.code);
+  const transientError = apiError && ["CAPTION_FETCH_BLOCKED", "RATE_LIMITED", "TIMEOUT", "FETCH_FAILED", "NETWORK_ERROR"].includes(apiError.code);
   const noCaptions = apiError && ["NO_CAPTIONS", "CAPTIONS_DISABLED"].includes(apiError.code);
 
   return (
